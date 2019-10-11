@@ -1,10 +1,6 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.parameter import Parameter
-import brevitas.nn as qnn
-from brevitas.nn.quant_conv import PaddingType
-from brevitas.core.quant import QuantType
 
 from .utils import (
     relu_fn,
@@ -19,6 +15,8 @@ from .utils import (
     WSConv2d_v1,
 )
 
+__all__ = ['efficientnet_b0_dq_ori']
+
 class MBConvBlock(nn.Module):
     """
     Mobile Inverted Residual Bottleneck Block
@@ -31,100 +29,49 @@ class MBConvBlock(nn.Module):
         has_se (bool): Whether the block contains a Squeeze and Excitation layer.
     """
 
-    def __init__(self, block_args, global_params, enable_se=True, group_se = True, sampling = True, sampling_rate = 0.5, half_up_sampling=1, 
-        group_first_1x1 =False, rm_first_1x1=False, shortcut_coeff=False, quant = True):
+    def __init__(self, block_args, global_params, sampling = True):
         super().__init__()
         self._block_args = block_args
         self._bn_mom = 1 - global_params.batch_norm_momentum
         self._bn_eps = global_params.batch_norm_epsilon
-        self.has_se = (self._block_args.se_ratio is not None) and (0 < self._block_args.se_ratio <= 1) and enable_se
+        self.has_se = (self._block_args.se_ratio is not None) and (0 < self._block_args.se_ratio <= 1)
         self.id_skip = block_args.id_skip  # skip connection and drop connect
-        self.rm_first_1x1 = rm_first_1x1
-        self.shortcut_coeff = shortcut_coeff
-        multiplier1 = 1/(sampling_rate * half_up_sampling) if sampling else 1
-        multiplier2 = 1/sampling_rate if sampling else 1
-
-        if self.shortcut_coeff:
-            self.coeff_shortcut = Parameter(torch.Tensor(2), requires_grad=True)
-        # use learnable coefficeints to replace first 1x1 conv layer
-        if self._block_args.expand_ratio > 1 and rm_first_1x1:
-            self.coefficient = Parameter(torch.Tensor(self._block_args.expand_ratio), requires_grad=True)
-            self.coeff_scale_a = Parameter(torch.Tensor(self._block_args.expand_ratio), requires_grad=True)
-            self.coeff_scale_b = Parameter(torch.Tensor(self._block_args.expand_ratio), requires_grad=True)
         print("Using WSNetV2 conv", sampling)
-        
+
         # Expansion phase
         inp = self._block_args.input_filters  # number of input channels
         oup = self._block_args.input_filters * self._block_args.expand_ratio  # number of output channels
-        self.oup = oup
-        if self._block_args.expand_ratio != 1 and (not rm_first_1x1):
-            if group_first_1x1:
-                self._expand_conv = Conv2dSamePadding(in_channels=inp, out_channels=oup, kernel_size=1, bias=False, groups=inp//4)
+        if self._block_args.expand_ratio != 1:
+            if not sampling:
+                self._expand_conv = Conv2dSamePadding(in_channels=inp, out_channels=oup, kernel_size=1, bias=False)
             else:
-                if not sampling:
-                    if quant:
-                        self._expand_conv = qnn.QuantConv2d(in_channels=inp, out_channels=oup, kernel_size=1, bias=False,
-                        weight_quant_type=QuantType.INT, weight_bit_width=8, padding_type=PaddingType.SAME, multiplier1=1, multiplier2=2)
-                    else:
-                        self._expand_conv = Conv2dSamePadding(in_channels=inp, out_channels=oup, kernel_size=1, bias=False)
-                else:
-                    self._expand_conv = WSConv2d_v1(inp, oup, kernel_size=1, bias=False, multiplier = multiplier1, rep_dim=0, use_coeff=False)
-                    # print(self._expand_conv)
-                    # import pdb; pdb.set_trace()
-        self._bn0 = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
-        #self._bn0_1 = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
+                self._expand_conv = WSConv2d_v1(inp, oup, kernel_size=1, bias=False, multiplier = 4/2, rep_dim=0, use_coeff=False)
+                # print(self._expand_conv)
+                # import pdb; pdb.set_trace()
+            self._bn0 = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
 
         # Depthwise convolution phase
         k = self._block_args.kernel_size
         s = self._block_args.stride
-        if not quant:
-            self._depthwise_conv = qnn.QuantConv2d(in_channels=oup, out_channels=oup, kernel_size=1, bias=False,
-                        weight_quant_type=QuantType.INT, weight_bit_width=8, padding_type=PaddingType.SAME, groups=oup, multiplier1=1, multiplier2=1)
-        else:
-            self._depthwise_conv = Conv2dSamePadding(
-                in_channels=oup, out_channels=oup, groups=oup,  # groups makes it depthwise
-                kernel_size=k, stride=s, bias=False)
+        self._depthwise_conv = Conv2dSamePadding(
+            in_channels=oup, out_channels=oup, groups=oup,  # groups makes it depthwise
+            kernel_size=k, stride=s, bias=False)
         self._bn1 = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
-        #self._bn1_1 = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
 
         # Squeeze and Excitation layer, if desired
         if self.has_se:
             num_squeezed_channels = max(1, int(self._block_args.input_filters * self._block_args.se_ratio))
-            if group_se:
-                self._se_reduce = Conv2dSamePadding(in_channels=oup, out_channels=num_squeezed_channels, groups = num_squeezed_channels, kernel_size=1)
-                self._se_expand = Conv2dSamePadding(in_channels=num_squeezed_channels, out_channels=oup, groups = num_squeezed_channels, kernel_size=1)
-            else:
-                self._se_reduce = Conv2dSamePadding(in_channels=oup, out_channels=num_squeezed_channels, kernel_size=1)
-                self._se_expand = Conv2dSamePadding(in_channels=num_squeezed_channels, out_channels=oup, kernel_size=1)
-            # self._bn_se = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
+            self._se_reduce = Conv2dSamePadding(in_channels=oup, out_channels=num_squeezed_channels, kernel_size=1)
+            self._se_expand = Conv2dSamePadding(in_channels=num_squeezed_channels, out_channels=oup, kernel_size=1)
 
         # Output phase
         final_oup = self._block_args.output_filters
         if not sampling:
-            if quant:
-                self._project_conv = qnn.QuantConv2d(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False,
-                        weight_quant_type=QuantType.INT, weight_bit_width=8, padding_type=PaddingType.SAME, multiplier1=2, multiplier2=1 )
-            else:
-                self._project_conv = Conv2dSamePadding(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False)
+            self._project_conv = Conv2dSamePadding(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False)
         else:
-            self._project_conv = WSConv2d_v1(oup, final_oup, kernel_size=1, bias=False, multiplier = multiplier2, rep_dim=1, use_coeff=False)
+            self._project_conv = WSConv2d_v1(oup, final_oup, kernel_size=1, bias=False, multiplier = 4/2, rep_dim=1, use_coeff=False)
         self._bn2 = nn.BatchNorm2d(num_features=final_oup, momentum=self._bn_mom, eps=self._bn_eps)
-        
-        # self.last_bn = nn.BatchNorm2d(num_features=final_oup, momentum=self._bn_mom, eps=self._bn_eps)
-    def sampling_feature(self, x, output_dim):
-        if self._block_args.expand_ratio == 1:
-            return x
-        x_tmp = torch.cat([x,x],dim=1)
-        x_new = []
-        # import pdb; pdb.set_trace()
-        for i in range(self._block_args.expand_ratio):
-            coeff = torch.sigmoid(self.coefficient[i]) * self._block_args.expand_ratio
-            coeff_int = int(torch.ceil(coeff))
-            coeff_frac = coeff - coeff_int
-            x_new.append(x_tmp[:,coeff_int:int(coeff_int+x.shape[1]),:,:] * coeff_frac * self.coeff_scale_a + 
-            x_tmp[:,int(coeff_int + 1):int(coeff_int + x.shape[1]+1),:,:] * (1-coeff_frac) * self.coeff_scale_b)
-        
-        return torch.cat(x_new,dim=1)
+
     def forward(self, inputs, drop_connect_rate=None):
         """
         :param inputs: input tensor
@@ -134,28 +81,19 @@ class MBConvBlock(nn.Module):
 
         # Expansion and Depthwise Convolution
         x = inputs
-        
         if self._block_args.expand_ratio != 1:
             try:
-                if self.rm_first_1x1:
-                    x = relu_fn(self._bn0(self.sampling_feature(x, self.oup)))
-                    # import pdb; pdb.set_trace()
-                else:
-                    x = relu_fn(self._bn0(self._expand_conv(inputs)))
+                x = relu_fn(self._bn0(self._expand_conv(inputs)))
             except:
                 import pdb;pdb.set_trace()
         x = relu_fn(self._bn1(self._depthwise_conv(x)))
-        
+
         # Squeeze and Excitation
         if self.has_se:
             x_squeezed = F.adaptive_avg_pool2d(x, 1)
-            # NOTE: think of if add a bn-relu pair here or not
             x_squeezed = self._se_expand(relu_fn(self._se_reduce(x_squeezed)))
-            try:
-                x = torch.sigmoid(x_squeezed) * x
-            except:
-                import pdb;pdb.set_trace()
-        # import pdb;pdb.set_trace()
+            x = torch.sigmoid(x_squeezed) * x
+
         x = self._bn2(self._project_conv(x))
 
         # Skip connection and drop connect
@@ -163,10 +101,7 @@ class MBConvBlock(nn.Module):
         if self.id_skip and self._block_args.stride == 1 and input_filters == output_filters:
             if drop_connect_rate:
                 x = drop_connect(x, p=drop_connect_rate, training=self.training)
-            if self.shortcut_coeff:
-                x = x * self.coeff_shortcut[0] + inputs * self.coeff_shortcut[1]
-            else:
-                x = x + inputs  # skip connection
+            x = x + inputs  # skip connection
         return x
 
 
@@ -183,23 +118,12 @@ class EfficientNet(nn.Module):
 
     """
 
-    def __init__(self, blocks_args=None, global_params=None, margs = None):
+    def __init__(self, blocks_args=None, global_params=None):
         super().__init__()
         assert isinstance(blocks_args, list), 'blocks_args should be a list'
         assert len(blocks_args) > 0, 'block args must be greater than 0'
         self._global_params = global_params
-        self.fc_compress = margs.fc_compress
         self._blocks_args = blocks_args
-        self.args = margs
-        self.half_up_sampling = margs.up_sampling_ratio
-        
-        sampling = margs.sampling
-        # indexing           1     2   3   4   5   6   7   8   9   10  11  12  13  14  15  16
-        # uniform sampling rate
-        # self.sampling_cfg = [0.5] * 16
-        # import pdb; pdb.set_trace()
-        self.sampling_cfg = [0.5, 0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5, 0.5]
-        # self.sampling_cfg = [0.5, 0.5,0.5,0.5,0.5,0.5,0.4,0.5,0.4,0.5,0.4,0.5,0.4,0.5,0.5]
 
         # Batch norm parameters
         bn_mom = 1 - self._global_params.batch_norm_momentum
@@ -213,7 +137,6 @@ class EfficientNet(nn.Module):
 
         # Build blocks
         self._blocks = nn.ModuleList([])
-        idx = 0
         for block_args in self._blocks_args:
 
             # Update block input and output filters based on depth multiplier.
@@ -224,37 +147,21 @@ class EfficientNet(nn.Module):
             )
 
             # The first block needs to take care of stride and filter size increase.
-            self._blocks.append(MBConvBlock(block_args, self._global_params, sampling_rate = self.sampling_cfg[idx], enable_se=self.args.enable_se,
-            group_se=self.args.group_se, sampling=self.args.sampling,half_up_sampling=self.half_up_sampling, shortcut_coeff = self.args.shortcut_coeff))
-            idx += 1
-            idx = idx % len(self.sampling_cfg)
+            self._blocks.append(MBConvBlock(block_args, self._global_params))
             if block_args.num_repeat > 1:
                 block_args = block_args._replace(input_filters=block_args.output_filters, stride=1)
             for _ in range(block_args.num_repeat - 1):
-                self._blocks.append(MBConvBlock(block_args, self._global_params, sampling_rate = self.sampling_cfg[idx], enable_se=self.args.enable_se,
-            group_se=self.args.group_se, sampling=self.args.sampling,half_up_sampling=self.half_up_sampling, shortcut_coeff = self.args.shortcut_coeff))
-                idx += 1
-                idx = idx % len(self.sampling_cfg)
+                self._blocks.append(MBConvBlock(block_args, self._global_params))
 
         # Head
         in_channels = block_args.output_filters  # output of final block
         out_channels = round_filters(1280, self._global_params)
-        if sampling:
-            self._conv_head = WSConv2d_v1(in_channels, out_channels, kernel_size=1, bias=False, multiplier = 4/2, rep_dim=1, use_coeff=False)
-        else:
-            self._conv_head = Conv2dSamePadding(in_channels, out_channels, kernel_size=1, bias=False)
+        self._conv_head = Conv2dSamePadding(in_channels, out_channels, kernel_size=1, bias=False)
         self._bn1 = nn.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
 
         # Final linear layer
         self._dropout = self._global_params.dropout_rate
-        if self.fc_compress == 'fact_fc':
-            low_rank_channels = 320
-            self._fc_r1 = nn.Linear(out_channels, low_rank_channels)
-            self._fc_r2 = nn.Linear(low_rank_channels, self._global_params.num_classes)
-        elif self.fc_compress == 'group_fc':
-            self._fc = Conv2dSamePadding(out_channels, self._global_params.num_classes, kernel_size=1, groups=4, bias=True)
-        else:
-            self._fc = nn.Linear(out_channels, self._global_params.num_classes)
+        self._fc = nn.Linear(out_channels, self._global_params.num_classes)
 
     def extract_features(self, inputs):
         """ Returns output of the final convolution layer """
@@ -282,21 +189,14 @@ class EfficientNet(nn.Module):
         x = F.adaptive_avg_pool2d(x, 1).squeeze(-1).squeeze(-1)
         if self._dropout:
             x = F.dropout(x, p=self._dropout, training=self.training)
-        if self.fc_compress == 'fact_fc':
-            x = self._fc_r1(x)
-            x = self._fc_r2(relu_fn(self._fc_r1(x)))
-        elif self.fc_compress == 'group_fc':
-            x = self._fc(x.view(-1,1280,1,1)).view(-1,1000)
-        else:
-            x = self._fc(x)
+        x = self._fc(x)
         return x
 
     @classmethod
-    def from_name(cls, model_name, override_params=None, margs = None):
-        # import pdb; pdb.set_trace()
+    def from_name(cls, model_name, override_params=None):
         cls._check_model_name_is_valid(model_name)
         blocks_args, global_params = get_model_params(model_name, override_params)
-        return EfficientNet(blocks_args = blocks_args, global_params = global_params, margs = margs)
+        return EfficientNet(blocks_args, global_params)
 
     @classmethod
     def from_pretrained(cls, model_name):
@@ -318,3 +218,6 @@ class EfficientNet(nn.Module):
         valid_models = ['efficientnet_b'+str(i) for i in range(num_models)]
         if model_name.replace('-','_') not in valid_models:
             raise ValueError('model_name should be one of: ' + ', '.join(valid_models))
+
+def efficientnet_b0_dq_ori():
+    return EfficientNet.from_name(model_name = 'efficientnet-b0')

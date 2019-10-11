@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils import model_zoo
+from distiller.modules import EltwiseAdd, EltwiseMult, EltwiseDiv
 
 
 ########################################################################
@@ -79,7 +80,7 @@ def drop_connect(inputs, p, training):
     return output
 
 
-class Conv2dSamePadding(nn.Conv2d):
+class Conv2dSamePadding_v0(nn.Conv2d):
     """ 2D Convolutions like TensorFlow """
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1, bias=True, nbit=4):
         super().__init__(in_channels, out_channels, kernel_size, stride, 0, dilation, groups, bias)
@@ -87,7 +88,13 @@ class Conv2dSamePadding(nn.Conv2d):
 
         self.num_filters = in_channels
         self.nbits = nbit
+        self.ceil = math.ceil
         bit_dims = [nbit, in_channels]
+        # self.add = EltwiseAdd()
+        # self.div = EltwiseDiv()
+        # self.mul = EltwiseMult()
+        # #if pad_h > 0 or pad_w > 0:
+        # self.static_padding = nn.ZeroPad2d((0 // 2, 0 - 0 // 2, 0 // 2, 0 - 0 // 2))
         # self.basis = Parameter(torch.Tensor(nbit, in_channels), requires_grad=True)
 
     # def QuantizedWeight(self, x, n, nbit=4):
@@ -253,17 +260,106 @@ class Conv2dSamePadding(nn.Conv2d):
         pad_h = max((oh - 1) * self.stride[0] + (kh - 1) * self.dilation[0] + 1 - ih, 0)
         pad_w = max((ow - 1) * self.stride[1] + (kw - 1) * self.dilation[1] + 1 - iw, 0)
         # import pdb; pdb.set_trace()
+        #oh, ow = torch.ceil(self.div(ih.float(), sh)), torch.ceil(self.div(iw.float(), sw))
+        #pad_h = max(self.add(self.mul(self.add(oh.float(), -1), self.stride[0]) ,self.mul(self.add(kh, -1), self.add(self.add(self.dilation[0], 1), -ih))), 0)
+        #pad_w = max((ow - 1) * self.stride[1] + (kw - 1) * self.dilation[1] + 1 - iw, 0)
+        # import pdb; pdb.set_trace()
         # dims = self.weight.shape
         # ele_num = dims[0] * dims[1] * dims[2]
         # self.QuantizedWeight(self.weight, ele_num,self.nbits)
         if pad_h > 0 or pad_w > 0:
             x = F.pad(x, [pad_w//2, pad_w - pad_w//2, pad_h//2, pad_h - pad_h//2])
-        return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+        out = F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+        return out
+#class Identity(nn.Module):
+#    def __init__(self,):
+#        super(Identity, self).__init__()
+#
+#    def forward(self, input):
+#        return input
 
+class Conv2dSamePadding(nn.Conv2d):
+    """ 2D Convolutions like TensorFlow, for a fixed image size"""
+    def __init__(self, in_channels, out_channels, kernel_size, image_size=224, **kwargs):
+        super(Conv2dSamePadding, self).__init__(in_channels, out_channels, kernel_size, **kwargs)
+        self.stride = self.stride if len(self.stride) == 2 else [self.stride[0]] * 2
+
+        # Calculate padding based on image size and save it
+        assert image_size is not None
+        ih, iw = image_size if type(image_size) == list else [image_size, image_size]
+        kh, kw = self.weight.size()[-2:]
+        sh, sw = self.stride
+        oh, ow = math.ceil(ih / sh), math.ceil(iw / sw)
+        pad_h = max((oh - 1) * self.stride[0] + (kh - 1) * self.dilation[0] + 1 - ih, 0)
+        pad_w = max((ow - 1) * self.stride[1] + (kw - 1) * self.dilation[1] + 1 - iw, 0)
+        #if pad_h > 0 or pad_w > 0:
+        self.static_padding = nn.ZeroPad2d((pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2))
+        #else:
+            # self.static_padding = Identity()
+
+    def forward(self, x):
+        x_tmp = self.static_padding(x)
+        # import pdb; pdb.set_trace()
+        out = F.conv2d(x_tmp.half(), self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+        return out
+class WSConv2d_v1_v0(nn.Conv2d):
+    def __init__(self, in_planes, out_channels,
+                 kernel_size, stride=1, padding=0, dilation=1,
+                 groups=1, bias=True, multiplier = 1.0, rep_dim = 1, repeat_weight = True, use_coeff=False, image_size = 224):
+        if rep_dim == 0:
+            # this is repeat along the channel dim (dimension 0 of the weights tensor)
+            super(WSConv2d_v1, self).__init__(
+                int(in_planes), int(np.ceil(out_channels/ multiplier)),
+                kernel_size, stride=stride, padding=padding, dilation=dilation,
+                groups=groups, bias=bias)
+            self.rep_time = int(np.ceil(
+            1. * out_channels / self.weight.shape[0]))
+        elif rep_dim == 1:
+            # this is to repeat along the filter dim(dimension 1 of the weights tensor)
+            super(WSConv2d_v1, self).__init__(
+                int(np.ceil(in_planes/ multiplier)),int(out_channels),
+                kernel_size, stride=stride, padding=padding, dilation=dilation,
+                groups=groups, bias=bias)
+            self.rep_time = int(np.ceil(
+            1. * in_planes / self.weight.shape[1]))
+
+        self.in_planes = in_planes
+        self.out_channels_ori = out_channels
+        self.groups = groups
+        self.multiplier = multiplier
+        self.rep_dim = rep_dim
+        self.repeat_weight = repeat_weight
+        self.use_coeff = use_coeff
+        self.coefficient = Parameter(torch.Tensor(self.rep_time), requires_grad=False)
+        self.reuse = False
+        self.coeff_grad = None
+
+         # Calculate padding based on image size and save it
+        assert image_size is not None
+        ih, iw = image_size if type(image_size) == list else [image_size, image_size]
+        kh, kw = self.weight.size()[-2:]
+        sh, sw = self.stride
+        oh, ow = math.ceil(ih / sh), math.ceil(iw / sw)
+        pad_h = max((oh - 1) * self.stride[0] + (kh - 1) * self.dilation[0] + 1 - ih, 0)
+        pad_w = max((ow - 1) * self.stride[1] + (kw - 1) * self.dilation[1] + 1 - iw, 0)
+        #if pad_h > 0 or pad_w > 0:
+        self.static_padding = nn.ZeroPad2d((pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2))
+    def forward(self, x):
+        """
+            same padding as efficientnet tf version
+        """
+        x = self.static_padding(x)
+        if self.rep_dim == 0:
+            #out = F.conv2d(x, self.weight.repeat([self.rep_time,1,1,1])[:self.out_channels_ori,:,:,:], None, 1)
+            out = F.conv2d(x, self.weight.repeat([self.rep_time,1,1,1]), None, 1)
+        else:
+            #out = F.conv2d(x, self.weight.repeat([1,self.rep_time,1,1])[:,:x.shape[1],:,:], None, 1)
+            out = F.conv2d(x, self.weight.repeat([1,self.rep_time,1,1]), None, 1)
+        return out
 class WSConv2d_v1(nn.Conv2d):
     def __init__(self, in_planes, out_channels,
                  kernel_size, stride=1, padding=0, dilation=1,
-                 groups=1, bias=True, multiplier = 1.0, rep_dim = 1, repeat_weight = True, use_coeff=False):
+                 groups=1, bias=True, multiplier = 1.0, rep_dim = 1, repeat_weight = True, use_coeff=False, image_size = 224):
         if rep_dim == 0:
             # this is repeat along the channel dim (dimension 0 of the weights tensor)
             super(WSConv2d_v1, self).__init__(
@@ -292,6 +388,16 @@ class WSConv2d_v1(nn.Conv2d):
         self.reuse = False
         self.coeff_grad = None
 
+         # Calculate padding based on image size and save it
+        #assert image_size is not None
+        #ih, iw = image_size if type(image_size) == list else [image_size, image_size]
+        #kh, kw = self.weight.size()[-2:]
+        #sh, sw = self.stride
+        #oh, ow = math.ceil(ih / sh), math.ceil(iw / sw)
+        #pad_h = max((oh - 1) * self.stride[0] + (kh - 1) * self.dilation[0] + 1 - ih, 0)
+        #pad_w = max((ow - 1) * self.stride[1] + (kw - 1) * self.dilation[1] + 1 - iw, 0)
+        ##if pad_h > 0 or pad_w > 0:
+        #self.static_padding = nn.ZeroPad2d((pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2))
     def forward(self, x):
         """
             same padding as efficientnet tf version
@@ -305,11 +411,14 @@ class WSConv2d_v1(nn.Conv2d):
         if pad_h > 0 or pad_w > 0:
             x = F.pad(x, [pad_w//2, pad_w - pad_w//2, pad_h//2, pad_h - pad_h//2])
         
-        # print("use_coeff == False")
+        # print("use_coeff == Falsei")
+        # x = self.static_padding(x)
         if self.rep_dim == 0:
-            out = F.conv2d(x, self.weight.repeat([self.rep_time,1,1,1])[:self.out_channels_ori,:,:,:], None, 1)
+            #out = F.conv2d(x, self.weight.repeat([self.rep_time,1,1,1])[:self.out_channels_ori,:,:,:], None, 1)
+            out = F.conv2d(x, self.weight.repeat([self.rep_time,1,1,1]), None, 1)
         else:
-            out = F.conv2d(x, self.weight.repeat([1,self.rep_time,1,1])[:,:x.shape[1],:,:], None, 1)
+            #out = F.conv2d(x, self.weight.repeat([1,self.rep_time,1,1])[:,:x.shape[1],:,:], None, 1)
+            out = F.conv2d(x, self.weight.repeat([1,self.rep_time,1,1]), None, 1)
         return out
 class WSConv2d(nn.Conv2d):
     def __init__(self, in_planes, out_channels,

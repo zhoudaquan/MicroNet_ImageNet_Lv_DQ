@@ -13,3 +13,6 @@ FLOPs: 460M
 As a result, we are eligible to use the free 16-bit quantization gift and thus the model parameter number is reduded to 1.55M and the FLOPs is reduced to 460M * 0.75 as all the multiplications are as quantized to 16 bits also.
 
 Thus, the total score is calculated as 1.96M/6.9M + 345M/1170M = 0.578
+
+## evaluation
+To evaluate the model, simply load the model in the efficientnet_quant folder and resume the checkpoint named 75_5_model.

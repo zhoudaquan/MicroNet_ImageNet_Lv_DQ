@@ -8,7 +8,10 @@ The compression method is mainly based on the paper [NES](https://openreview.net
 The resulting model specification is as below:
 
 Parameter number: 3.92M
+
 FLOPs: 460M
+
+MicroNet Score: 0.578
 
 As a result, we are eligible to use the free 16-bit quantization gift and thus the model parameter number is reduded to 1.55M and the FLOPs is reduced to 460M * 0.75 as all the multiplications are as quantized to 16 bits also.
 

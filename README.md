@@ -15,4 +15,8 @@ As a result, we are eligible to use the free 16-bit quantization gift and thus t
 Thus, the total score is calculated as 1.96M/6.9M + 345M/1170M = 0.578
 
 ## evaluation
-To evaluate the model, simply load the model in the efficientnet_quant folder and resume the checkpoint named 75_5_model.
+To evaluate the model, simply load the model in the efficientnet_quant folder and resume the checkpoint named 75_5_model by running the bash file run_validate.sh.
+
+bash run_validate.py
+
+To run the file, one needs to modify the data path to the imagenet data folder.
